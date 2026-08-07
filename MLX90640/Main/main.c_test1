@@ -1,0 +1,800 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : MLX90640 temperature detection with LED control
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+#include "MLX90640_API.h"
+#include "MLX90640_I2C_Driver.h"
+#include <math.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/*
+ * MLX90640 기본 7비트 I2C 주소
+ */
+#define MLX90640_I2C_ADDRESS       0x33U
+
+/*
+ * LED가 켜지는 기준 온도
+ */
+#define TEMPERATURE_THRESHOLD_C    60.0f
+
+/*
+ * 물체 방사율
+ * 일반적인 무광 물체를 대상으로 한 초기 설정값
+ */
+#define MLX90640_EMISSIVITY         0.95f
+
+/*
+ * 한 프레임을 얻기 위해 허용할 최대 측정 횟수
+ * MLX90640은 subpage 0, subpage 1 두 장으로 전체 영상을 만듭니다.
+ */
+#define MLX90640_MAX_FRAME_TRIES    6U
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+I2C_HandleTypeDef hi2c1;
+
+/* USER CODE BEGIN PV */
+
+/*
+ * MLX90640 EEPROM 보정 데이터
+ * 공식 API에서 832워드를 사용합니다.
+ */
+static uint16_t mlx90640_eeprom[832];
+
+/*
+ * 프레임 데이터
+ * 픽셀 768개 + 보조 데이터 + 제어 데이터로 총 834워드입니다.
+ */
+static uint16_t mlx90640_frame[834];
+
+/*
+ * 계산된 32 × 24 = 768개 픽셀 온도
+ */
+static float mlx90640_temperature[768];
+
+/*
+ * EEPROM에서 추출한 센서 보정 파라미터
+ */
+static paramsMLX90640 mlx90640_parameters;
+
+/*
+ * 디버거에서 확인할 변수
+ */
+volatile float ambient_temperature = 0.0f;
+volatile float maximum_temperature = 0.0f;
+
+volatile uint16_t maximum_temperature_pixel = 0U;
+volatile uint16_t hot_pixel_count = 0U;
+
+volatile int32_t mlx90640_error_code = 0;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+
+/* USER CODE BEGIN PFP */
+
+static int32_t MLX90640_SensorInit(void);
+static int32_t MLX90640_ReadFullFrame(void);
+static float MLX90640_FindMaximumTemperature(void);
+static uint16_t MLX90640_CountHotPixels(float threshold);
+static void LED_ErrorBlink(uint32_t delay_ms);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/**
+  * @brief MLX90640 초기화
+  * @retval 0 성공, 음수 오류
+  */
+static int32_t MLX90640_SensorInit(void)
+{
+    int32_t status;
+
+    /*
+     * 센서가 I2C 주소 0x33에서 응답하는지 확인합니다.
+     *
+     * STM32 HAL에는 7비트 주소를 왼쪽으로 한 칸 이동한 값을
+     * 전달해야 합니다.
+     */
+    if (HAL_I2C_IsDeviceReady(&hi2c1,
+                              (uint16_t)(MLX90640_I2C_ADDRESS << 1),
+                              5U,
+                              1000U) != HAL_OK)
+    {
+        return -1;
+    }
+
+    /*
+     * MLX90640 EEPROM의 보정 데이터를 읽습니다.
+     */
+    status = MLX90640_DumpEE(MLX90640_I2C_ADDRESS,
+                             mlx90640_eeprom);
+
+    if (status != 0)
+    {
+        return -2;
+    }
+
+    /*
+     * EEPROM 데이터에서 픽셀별 보정 파라미터를 계산합니다.
+     */
+    status = MLX90640_ExtractParameters(mlx90640_eeprom,
+                                        &mlx90640_parameters);
+
+    if (status != 0)
+    {
+        return -3;
+    }
+
+    /*
+     * Chess mode로 설정합니다.
+     */
+    status = MLX90640_SetChessMode(MLX90640_I2C_ADDRESS);
+
+    if (status != 0)
+    {
+        return -4;
+    }
+
+    /*
+     * ADC 해상도 설정
+     *
+     * 0: 16-bit
+     * 1: 17-bit
+     * 2: 18-bit
+     * 3: 19-bit
+     */
+    status = MLX90640_SetResolution(MLX90640_I2C_ADDRESS,
+                                    3U);
+
+    if (status != 0)
+    {
+        return -5;
+    }
+
+    /*
+     * Refresh rate 설정
+     *
+     * 0: 0.5 Hz
+     * 1: 1 Hz
+     * 2: 2 Hz
+     * 3: 4 Hz
+     * 4: 8 Hz
+     * 5: 16 Hz
+     * 6: 32 Hz
+     * 7: 64 Hz
+     *
+     * 초기 테스트는 4 Hz로 설정합니다.
+     */
+    status = MLX90640_SetRefreshRate(MLX90640_I2C_ADDRESS,
+                                     3U);
+
+    if (status != 0)
+    {
+        return -6;
+    }
+
+    /*
+     * 초기 프레임이 준비될 시간을 줍니다.
+     */
+    HAL_Delay(500U);
+
+    return 0;
+}
+
+
+/**
+  * @brief MLX90640의 subpage 0과 subpage 1을 모두 읽습니다.
+  * @retval 0 성공, 음수 오류
+  */
+static int32_t MLX90640_ReadFullFrame(void)
+{
+    uint8_t received_subpages = 0U;
+    uint8_t attempt = 0U;
+
+    int32_t subpage;
+    float reflected_temperature;
+
+    /*
+     * MLX90640은 전체 768픽셀을 한 번에 갱신하지 않습니다.
+     *
+     * subpage 0과 subpage 1을 각각 읽어야 전체 온도 배열이
+     * 완성됩니다.
+     */
+    while ((received_subpages != 0x03U) &&
+           (attempt < MLX90640_MAX_FRAME_TRIES))
+    {
+        subpage = MLX90640_GetFrameData(
+            MLX90640_I2C_ADDRESS,
+            mlx90640_frame
+        );
+
+        /*
+         * 성공하면 0 또는 1이 반환됩니다.
+         * 음수이면 프레임 읽기 오류입니다.
+         */
+        if (subpage < 0)
+        {
+            return -10;
+        }
+
+        if (subpage > 1)
+        {
+            return -11;
+        }
+
+        /*
+         * 센서 자체 온도, 즉 주변 온도를 계산합니다.
+         */
+        ambient_temperature = MLX90640_GetTa(
+            mlx90640_frame,
+            &mlx90640_parameters
+        );
+
+        if (!isfinite(ambient_temperature))
+        {
+            return -12;
+        }
+
+        /*
+         * 반사 온도 보정값입니다.
+         *
+         * 초기 테스트에서는 주변 온도보다 8°C 낮은 값을
+         * 사용합니다.
+         */
+        reflected_temperature =
+            ambient_temperature - 8.0f;
+
+        /*
+         * 현재 subpage에 해당하는 픽셀의 물체 온도를 계산합니다.
+         */
+        MLX90640_CalculateTo(
+            mlx90640_frame,
+            &mlx90640_parameters,
+            MLX90640_EMISSIVITY,
+            reflected_temperature,
+            mlx90640_temperature
+        );
+
+        /*
+         * 현재 읽은 subpage를 표시합니다.
+         *
+         * subpage 0 수신: bit 0 = 1
+         * subpage 1 수신: bit 1 = 1
+         *
+         * 둘 다 수신하면 0x03이 됩니다.
+         */
+        received_subpages |= (uint8_t)(1U << subpage);
+
+        attempt++;
+    }
+
+    /*
+     * 정해진 횟수 동안 두 subpage를 모두 얻지 못한 경우
+     */
+    if (received_subpages != 0x03U)
+    {
+        return -13;
+    }
+
+    /*
+     * EEPROM에 기록된 불량 픽셀을 보정합니다.
+     */
+    MLX90640_BadPixelsCorrection(
+        mlx90640_parameters.brokenPixels,
+        mlx90640_temperature,
+        1,
+        &mlx90640_parameters
+    );
+
+    MLX90640_BadPixelsCorrection(
+        mlx90640_parameters.outlierPixels,
+        mlx90640_temperature,
+        1,
+        &mlx90640_parameters
+    );
+
+    return 0;
+}
+
+
+/**
+  * @brief 768개 픽셀 중 가장 높은 온도를 찾습니다.
+  * @retval 최고 온도
+  */
+static float MLX90640_FindMaximumTemperature(void)
+{
+    float max_temperature = -1000.0f;
+    uint16_t max_pixel = 0U;
+
+    for (uint16_t i = 0U; i < 768U; i++)
+    {
+        /*
+         * NaN이나 무한대 값은 제외합니다.
+         */
+        if (!isfinite(mlx90640_temperature[i]))
+        {
+            continue;
+        }
+
+        /*
+         * MLX90640의 일반적인 측정 범위를 크게 벗어난 값은
+         * 통신 또는 계산 오류로 판단하여 제외합니다.
+         */
+        if ((mlx90640_temperature[i] < -40.0f) ||
+            (mlx90640_temperature[i] > 300.0f))
+        {
+            continue;
+        }
+
+        if (mlx90640_temperature[i] > max_temperature)
+        {
+            max_temperature = mlx90640_temperature[i];
+            max_pixel = i;
+        }
+    }
+
+    maximum_temperature_pixel = max_pixel;
+
+    return max_temperature;
+}
+
+
+/**
+  * @brief 설정한 온도 이상인 픽셀 개수를 계산합니다.
+  * @param threshold 기준 온도
+  * @retval 기준 온도 이상인 픽셀 개수
+  */
+static uint16_t MLX90640_CountHotPixels(float threshold)
+{
+    uint16_t count = 0U;
+
+    for (uint16_t i = 0U; i < 768U; i++)
+    {
+        if (!isfinite(mlx90640_temperature[i]))
+        {
+            continue;
+        }
+
+        if ((mlx90640_temperature[i] >= threshold) &&
+            (mlx90640_temperature[i] <= 300.0f))
+        {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+
+/**
+  * @brief 치명적인 오류를 LED 점멸로 표시합니다.
+  * @param delay_ms 점멸 간격
+  */
+static void LED_ErrorBlink(uint32_t delay_ms)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(LED_GPIO_Port,
+                           LED_Pin);
+
+        HAL_Delay(delay_ms);
+    }
+}
+
+/* USER CODE END 0 */
+
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+    /* USER CODE BEGIN 1 */
+
+    /* USER CODE END 1 */
+
+    /* MCU Configuration------------------------------------------------------*/
+
+    /*
+     * 모든 주변장치, Flash 인터페이스 및 SysTick 초기화
+     */
+    HAL_Init();
+
+    /* USER CODE BEGIN Init */
+
+    /* USER CODE END Init */
+
+    /*
+     * 시스템 클록 설정
+     */
+    SystemClock_Config();
+
+    /* USER CODE BEGIN SysInit */
+
+    /* USER CODE END SysInit */
+
+    /*
+     * CubeMX에서 설정한 GPIO 및 I2C 초기화
+     */
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+
+    /* USER CODE BEGIN 2 */
+
+    /*
+     * 프로그램 시작 시 LED를 끕니다.
+     */
+    HAL_GPIO_WritePin(LED_GPIO_Port,
+                      LED_Pin,
+                      GPIO_PIN_RESET);
+
+    /*
+     * MLX90640 초기화
+     */
+    mlx90640_error_code = MLX90640_SensorInit();
+
+    if (mlx90640_error_code != 0)
+    {
+        /*
+         * 센서 초기화 실패
+         *
+         * 100 ms 간격으로 빠르게 깜빡입니다.
+         */
+        LED_ErrorBlink(100U);
+    }
+
+    /* USER CODE END 2 */
+
+    /* Infinite loop */
+    /* USER CODE BEGIN WHILE */
+
+    while (1)
+    {
+        /*
+         * MLX90640의 전체 온도 프레임을 읽습니다.
+         */
+        mlx90640_error_code = MLX90640_ReadFullFrame();
+
+        if (mlx90640_error_code == 0)
+        {
+            /*
+             * 768개 픽셀 중 최고 온도를 계산합니다.
+             */
+            maximum_temperature =
+                MLX90640_FindMaximumTemperature();
+
+            /*
+             * 60°C 이상인 픽셀 수도 계산합니다.
+             * 디버거 확인용입니다.
+             */
+            hot_pixel_count =
+                MLX90640_CountHotPixels(
+                    TEMPERATURE_THRESHOLD_C
+                );
+
+            /*
+             * 최고 온도가 60°C 이상이면 LED를 켭니다.
+             */
+            if (maximum_temperature >=
+                TEMPERATURE_THRESHOLD_C)
+            {
+                HAL_GPIO_WritePin(
+                    LED_GPIO_Port,
+                    LED_Pin,
+                    GPIO_PIN_SET
+                );
+            }
+            else
+            {
+                HAL_GPIO_WritePin(
+                    LED_GPIO_Port,
+                    LED_Pin,
+                    GPIO_PIN_RESET
+                );
+            }
+        }
+        else
+        {
+            /*
+             * 실행 중 프레임 읽기에 실패하면 LED를 끕니다.
+             */
+            HAL_GPIO_WritePin(
+                LED_GPIO_Port,
+                LED_Pin,
+                GPIO_PIN_RESET
+            );
+
+            /*
+             * 잠시 기다린 뒤 다시 측정합니다.
+             */
+            HAL_Delay(100U);
+        }
+
+        /*
+         * 4 Hz refresh rate에 맞춘 짧은 대기
+         */
+        HAL_Delay(20U);
+
+        /* USER CODE END WHILE */
+
+        /* USER CODE BEGIN 3 */
+    }
+
+    /* USER CODE END 3 */
+}
+
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    /*
+     * 메인 내부 레귤레이터 전압 설정
+     */
+    HAL_PWREx_ControlVoltageScaling(
+        PWR_REGULATOR_VOLTAGE_SCALE2
+    );
+
+    /*
+     * HSI 내부 발진기 설정
+     */
+    RCC_OscInitStruct.OscillatorType =
+        RCC_OSCILLATORTYPE_HSI;
+
+    RCC_OscInitStruct.HSIState =
+        RCC_HSI_ON;
+
+    RCC_OscInitStruct.HSICalibrationValue =
+        RCC_HSICALIBRATION_DEFAULT;
+
+    RCC_OscInitStruct.PLL.PLLState =
+        RCC_PLL_NONE;
+
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /*
+     * CPU, AHB, APB 버스 클록 설정
+     */
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1;
+
+    RCC_ClkInitStruct.SYSCLKSource =
+        RCC_SYSCLKSOURCE_HSI;
+
+    RCC_ClkInitStruct.AHBCLKDivider =
+        RCC_SYSCLK_DIV1;
+
+    RCC_ClkInitStruct.APB1CLKDivider =
+        RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct,
+                            FLASH_LATENCY_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+    /* USER CODE BEGIN I2C1_Init 0 */
+
+    /* USER CODE END I2C1_Init 0 */
+
+    /* USER CODE BEGIN I2C1_Init 1 */
+
+    /* USER CODE END I2C1_Init 1 */
+
+    hi2c1.Instance = I2C1;
+
+    /*
+     * CubeMX가 현재 클록 설정을 기준으로 생성한 Timing 값입니다.
+     * 기존 프로젝트의 값을 그대로 유지합니다.
+     */
+    hi2c1.Init.Timing = 0x0010061A;
+
+    hi2c1.Init.OwnAddress1 = 0;
+
+    hi2c1.Init.AddressingMode =
+        I2C_ADDRESSINGMODE_7BIT;
+
+    hi2c1.Init.DualAddressMode =
+        I2C_DUALADDRESS_DISABLE;
+
+    hi2c1.Init.OwnAddress2 = 0;
+
+    hi2c1.Init.OwnAddress2Masks =
+        I2C_OA2_NOMASK;
+
+    hi2c1.Init.GeneralCallMode =
+        I2C_GENERALCALL_DISABLE;
+
+    hi2c1.Init.NoStretchMode =
+        I2C_NOSTRETCH_DISABLE;
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /*
+     * 아날로그 필터 활성화
+     */
+    if (HAL_I2CEx_ConfigAnalogFilter(
+            &hi2c1,
+            I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /*
+     * 디지털 필터 비활성화
+     */
+    if (HAL_I2CEx_ConfigDigitalFilter(
+            &hi2c1,
+            0) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* USER CODE BEGIN I2C1_Init 2 */
+
+    /* USER CODE END I2C1_Init 2 */
+}
+
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+    /* USER CODE END MX_GPIO_Init_1 */
+
+    /*
+     * GPIO 포트 클록 활성화
+     */
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    /*
+     * LED 초기 상태: OFF
+     */
+    HAL_GPIO_WritePin(LED_GPIO_Port,
+                      LED_Pin,
+                      GPIO_PIN_RESET);
+
+    /*
+     * LED GPIO 출력 설정
+     */
+    GPIO_InitStruct.Pin = LED_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+
+    HAL_GPIO_Init(LED_GPIO_Port,
+                  &GPIO_InitStruct);
+
+    /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+    /* USER CODE END MX_GPIO_Init_2 */
+}
+
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+    /* USER CODE BEGIN Error_Handler_Debug */
+
+    __disable_irq();
+
+    while (1)
+    {
+        /*
+         * CubeMX 초기화 오류 발생 시 LED를 빠르게 반전합니다.
+         *
+         * 인터럽트가 비활성화되어 HAL_Delay를 사용할 수 없으므로
+         * 단순 반복 지연을 사용합니다.
+         */
+        HAL_GPIO_TogglePin(LED_GPIO_Port,
+                           LED_Pin);
+
+        for (volatile uint32_t i = 0U;
+             i < 100000U;
+             i++)
+        {
+            /*
+             * 단순 지연
+             */
+        }
+    }
+
+    /* USER CODE END Error_Handler_Debug */
+}
+
+
+#ifdef USE_FULL_ASSERT
+
+/**
+  * @brief Reports the name of the source file and source line number
+  *        where the assert_param error occurred.
+  * @param file source file name
+  * @param line source line number
+  * @retval None
+  */
+void assert_failed(uint8_t *file,
+                   uint32_t line)
+{
+    /* USER CODE BEGIN 6 */
+
+    (void)file;
+    (void)line;
+
+    /* USER CODE END 6 */
+}
+
+#endif /* USE_FULL_ASSERT */
